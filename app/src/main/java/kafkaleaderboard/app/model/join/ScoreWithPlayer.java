@@ -7,7 +7,7 @@ public class ScoreWithPlayer {
     private ScoreEvent scoreEvent;
     private Player player;
 
-    private ScoreWithPlayer(ScoreEvent scoreEvent, Player player) {
+    public ScoreWithPlayer(ScoreEvent scoreEvent, Player player) {
         this.scoreEvent = scoreEvent;
         this.player = player;
     }

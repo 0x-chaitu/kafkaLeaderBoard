@@ -1,67 +1,169 @@
-
 package kafkaleaderboard.app;
 
+import io.javalin.Javalin;
+import io.javalin.http.Context;
+import kafkaleaderboard.app.model.join.Enriched;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.KafkaStreams;
+import org.apache.kafka.streams.KeyQueryMetadata;
 import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.StoreQueryParameters;
 import org.apache.kafka.streams.state.HostInfo;
 import org.apache.kafka.streams.state.KeyValueIterator;
 import org.apache.kafka.streams.state.QueryableStoreTypes;
 import org.apache.kafka.streams.state.ReadOnlyKeyValueStore;
+import org.apache.kafka.streams.state.StreamsMetadata;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import io.javalin.Javalin;
-import io.javalin.http.Context;
-import kafkaleaderboard.app.model.join.Enriched;
+class LeaderboardService {
+  private final HostInfo hostInfo;
+  private final KafkaStreams streams;
 
-import java.util.Map;
-import java.util.List;
-import java.util.HashMap;
+  private static final Logger log = LoggerFactory.getLogger(LeaderboardService.class);
 
-/**
- * LeaderboardService
- */
-public class LeaderboardService {
-    private final HostInfo hostInfo;
-    private final KafkaStreams streams;
+  LeaderboardService(HostInfo hostInfo, KafkaStreams streams) {
+    this.hostInfo = hostInfo;
+    this.streams = streams;
+  }
 
-    private static final Logger log = LoggerFactory.getLogger(LeaderboardService.class);
+  ReadOnlyKeyValueStore<String, HighScores> getStore() {
+    return streams.store(
+        StoreQueryParameters.fromNameAndType(
+            "leader-boards",
+            QueryableStoreTypes.keyValueStore()));
+  }
 
-    LeaderboardService(HostInfo hostInfo, KafkaStreams streams) {
-        this.hostInfo = hostInfo;
-        this.streams = streams;
+  void start() {
+    Javalin app = Javalin.create().start(hostInfo.port());
+
+    app.get("/leaderboard", this::getAll);
+
+    app.get("/leaderboard/count", this::getCount);
+
+    app.get("/leaderboard/count/local", this::getCountLocal);
+
+    app.get("/leaderboard/:from/:to", this::getRange);
+
+    app.get("/leaderboard/:key", this::getKey);
+  }
+
+  void getAll(Context ctx) {
+    Map<String, List<kafkaleaderboard.app.model.join.Enriched>> leaderboard = new HashMap<>();
+
+    KeyValueIterator<String, HighScores> range = getStore().all();
+    while (range.hasNext()) {
+      KeyValue<String, HighScores> next = range.next();
+      String game = next.key;
+      HighScores highScores = next.value;
+      leaderboard.put(game, highScores.toList());
+    }
+    // close the iterator to avoid memory leaks!
+    range.close();
+    // return a JSON response
+    ctx.json(leaderboard);
+  }
+
+  void getRange(Context ctx) {
+    String from = ctx.pathParam("from");
+    String to = ctx.pathParam("to");
+
+    Map<String, List<Enriched>> leaderboard = new HashMap<>();
+
+    KeyValueIterator<String, HighScores> range = getStore().range(from, to);
+    while (range.hasNext()) {
+      KeyValue<String, HighScores> next = range.next();
+      String game = next.key;
+      HighScores highScores = next.value;
+      leaderboard.put(game, highScores.toList());
+    }
+    // close the iterator to avoid memory leaks!
+    range.close();
+    // return a JSON response
+    ctx.json(leaderboard);
+  }
+
+  void getCount(Context ctx) {
+    long count = getStore().approximateNumEntries();
+
+    for (StreamsMetadata metadata : streams.allMetadataForStore("leader-boards")) {
+      if (!hostInfo.equals(metadata.hostInfo())) {
+        continue;
+      }
+      count += fetchCountFromRemoteInstance(metadata.hostInfo().host(), metadata.hostInfo().port());
     }
 
-    ReadOnlyKeyValueStore<String, HighScores> getStore() {
-        return streams.store(
-                StoreQueryParameters.fromNameAndType(
-                        "leader-boards",
-                        QueryableStoreTypes.keyValueStore()));
+    ctx.json(count);
+  }
+
+  long fetchCountFromRemoteInstance(String host, int port) {
+    OkHttpClient client = new OkHttpClient();
+
+    String url = String.format("http://%s:%d/leaderboard/count/local", host, port);
+    Request request = new Request.Builder().url(url).build();
+
+    try (Response response = client.newCall(request).execute()) {
+      return Long.parseLong(response.body().string());
+    } catch (Exception e) {
+      log.error("Could not get leaderboard count", e);
+      return 0L;
+    }
+  }
+
+  void getCountLocal(Context ctx) {
+    long count = 0L;
+    try {
+      count = getStore().approximateNumEntries();
+    } catch (Exception e) {
+      log.error("Could not get local leaderboard count", e);
+    } finally {
+      ctx.result(String.valueOf(count));
+    }
+  }
+
+  void getKey(Context ctx) {
+    String productId = ctx.pathParam("key");
+
+    KeyQueryMetadata metadata =
+        streams.queryMetadataForKey("leader-boards", productId, Serdes.String().serializer());
+
+    if (hostInfo.equals(metadata.activeHost())) {
+      log.info("Querying local store for key");
+      HighScores highScores = getStore().get(productId);
+
+      if (highScores == null) {
+        // game was not found
+        ctx.status(404);
+        return;
+      }
+
+      ctx.json(highScores.toList());
+      return;
     }
 
-    void getAll(Context ctx) {
-        String from = ctx.pathParam("from");
-        String to = ctx.pathParam("to");
+    String remoteHost = metadata.activeHost().host();
+    int remotePort = metadata.activeHost().port();
+    String url =
+        String.format(
+            "http://%s:%d/leaderboard/%s",
+            // params
+            remoteHost, remotePort, productId);
 
-        Map<String, List<Enriched>> leaderBoard = new HashMap<>();
+    OkHttpClient client = new OkHttpClient();
+    Request request = new Request.Builder().url(url).build();
 
-        KeyValueIterator<String, HighScores> range = getStore().all();
-        while (range.hasNext()) {
-            KeyValue<String, HighScores> next = range.next();
-            String game = next.key;
-            HighScores highScores = next.value;
-            leaderBoard.put(game, highScores.toList());
-        }
-        range.close();
-        ctx.json(leaderBoard);
+    try (Response response = client.newCall(request).execute()) {
+      log.info("Querying remote store for key");
+      ctx.result(response.body().string());
+    } catch (Exception e) {
+      ctx.status(500);
     }
-
-    public void start() {
-        Javalin app = Javalin.create().start(hostInfo.port());
-
-        app.get("/leaderboard", this::getAll);
-
-    }
-
+  }
 }

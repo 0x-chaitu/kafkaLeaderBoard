@@ -3,16 +3,9 @@
  */
 package kafkaleaderboard.app;
 
-import kafkaleaderboard.list.LinkedList;
-
-import static kafkaleaderboard.utilities.StringUtils.join;
-import static kafkaleaderboard.utilities.StringUtils.split;
-
 import java.util.Properties;
 
-import static kafkaleaderboard.app.MessageUtils.getMessage;
 
-import org.apache.commons.text.WordUtils;
 import org.apache.kafka.streams.KafkaStreams;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.Topology;
@@ -20,7 +13,7 @@ import org.apache.kafka.streams.state.HostInfo;
 
 public class App {
     public static void main(String[] args) {
-        Topology topology = LeaderBoardTopology.build();
+        Topology topology = LeaderboardTopology.build();
 
         String host = System.getProperty("host");
         Integer port = Integer.parseInt(System.getProperty("port"));
